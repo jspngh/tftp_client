@@ -1,8 +1,6 @@
 //! An implementation of the TFTP Client as specified in [RFC 1350](https://datatracker.ietf.org/doc/html/rfc1350)
 //! This includes retries and timeouts with exponential backoff
 
-use async_io::Timer;
-use async_net::UdpSocket;
 use futures_lite::{
     future::block_on,
     FutureExt,
@@ -49,15 +47,70 @@ pub enum Error {
     },
 }
 
+/// Trait to abstract over `std::net` and `async_net` UdpSockets
+#[allow(async_fn_in_trait)]
+// TODO: make this a sealed trait?
+pub trait UdpSocket {
+    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> std::io::Result<usize>;
+    async fn recv_from(
+        &self,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> std::io::Result<(usize, SocketAddr)>;
+}
+
+impl UdpSocket for async_net::UdpSocket {
+    #[inline]
+    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> std::io::Result<usize> {
+        self.send_to(buf, addr).await
+    }
+    #[inline]
+    async fn recv_from(
+        &self,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> std::io::Result<(usize, SocketAddr)> {
+        self.recv_from(buf)
+            .or(async {
+                async_io::Timer::after(timeout).await;
+                Err(ErrorKind::TimedOut.into())
+            })
+            .await
+    }
+}
+
+impl UdpSocket for std::net::UdpSocket {
+    #[inline]
+    async fn send_to(&self, buf: &[u8], addr: SocketAddr) -> std::io::Result<usize> {
+        self.send_to(buf, addr)
+    }
+    #[inline]
+    async fn recv_from(
+        &self,
+        buf: &mut [u8],
+        timeout: Duration,
+    ) -> std::io::Result<(usize, SocketAddr)> {
+        let original_timeout = self.read_timeout()?;
+        self.set_read_timeout(Some(timeout))?;
+        let result = self.recv_from(buf)?;
+        self.set_read_timeout(original_timeout)?;
+        Ok(result)
+    }
+}
+
 /// Download a file via tftp
-pub async fn download<T: AsRef<str> + std::fmt::Display>(
-    filename: T,
-    socket: &UdpSocket,
+pub async fn download<F, S>(
+    filename: F,
+    socket: &S,
     mut server: SocketAddr,
     timeout: Duration,
     max_timeout: Duration,
     retries: usize,
-) -> Result<Vec<u8>, Error> {
+) -> Result<Vec<u8>, Error>
+where
+    F: AsRef<str> + std::fmt::Display,
+    S: UdpSocket,
+{
     // Set our server address to the inital address, it will potentially change
     debug!("┌── GET {filename}");
     // Initialize the state of our state machine
@@ -104,14 +157,7 @@ pub async fn download<T: AsRef<str> + std::fmt::Display>(
             }
             State::Recv => {
                 let mut buf = vec![0; BLKSIZE + 4]; // The biggest a block can be, 2 bytes for opcode, 2 bytes for block n
-                let n = match socket
-                    .recv_from(&mut buf)
-                    .or(async {
-                        Timer::after(local_timeout).await;
-                        Err(ErrorKind::TimedOut.into())
-                    })
-                    .await
-                {
+                let n = match socket.recv_from(&mut buf, local_timeout).await {
                     Ok((n, remote_addr)) => {
                         next_addr = remote_addr;
                         n
@@ -176,7 +222,7 @@ pub async fn download<T: AsRef<str> + std::fmt::Display>(
 /// Download a file via tftp (blocking)
 pub fn download_blocking<T: AsRef<str> + std::fmt::Display>(
     filename: T,
-    socket: &UdpSocket,
+    socket: &std::net::UdpSocket,
     server: SocketAddr,
     timeout: Duration,
     max_timeout: Duration,
@@ -186,15 +232,19 @@ pub fn download_blocking<T: AsRef<str> + std::fmt::Display>(
 }
 
 /// Upload a file via tftp
-pub async fn upload<T: AsRef<str> + std::fmt::Display>(
-    filename: T,
+pub async fn upload<F, S>(
+    filename: F,
     data: &[u8],
-    socket: &UdpSocket,
+    socket: &S,
     mut server: SocketAddr,
     timeout: Duration,
     max_timeout: Duration,
     retries: usize,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    F: AsRef<str> + std::fmt::Display,
+    S: UdpSocket,
+{
     debug!("┌── PUT {filename}");
     // Initialize the state of our state machine
     let mut state = State::Send;
@@ -238,14 +288,7 @@ pub async fn upload<T: AsRef<str> + std::fmt::Display>(
             State::Recv => {
                 let mut buf = vec![0; BLKSIZE + 4];
 
-                let n = match socket
-                    .recv_from(&mut buf)
-                    .or(async {
-                        Timer::after(local_timeout).await;
-                        Err(ErrorKind::TimedOut.into())
-                    })
-                    .await
-                {
+                let n = match socket.recv_from(&mut buf, local_timeout).await {
                     Ok((n, remote_addr)) => {
                         next_addr = remote_addr;
                         n
@@ -320,7 +363,7 @@ pub async fn upload<T: AsRef<str> + std::fmt::Display>(
 pub fn upload_blocking<T: AsRef<str> + std::fmt::Display>(
     filename: T,
     data: &[u8],
-    socket: &UdpSocket,
+    socket: &std::net::UdpSocket,
     server: SocketAddr,
     timeout: Duration,
     max_timeout: Duration,
